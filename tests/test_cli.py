@@ -118,7 +118,8 @@ def test_launcher_starts_the_run_and_its_output_lands_in_the_log(tmp_path):
     name = f"t-launch-{os.getpid()}"
     log = ROOT / "logs" / f"{name}.log"
     try:
-        r = _launch([name, "--preset", "mock", "--goal", "two words"], COSCI_BIN=str(fake), COSCI_NO_NOTIFY="1")
+        r = _launch([name, "--preset", "mock", "--goal", "two words"], COSCI_BIN=str(fake), COSCI_NO_NOTIFY="1",
+                    COSCI_FORCE="1")   # a real run may be in progress on this machine; this starts only a fake
         assert r.returncode == 0, r.stdout + r.stderr
         deadline = time.time() + 10
         while time.time() < deadline and not (log.exists() and "[run]" in log.read_text()):
@@ -129,3 +130,42 @@ def test_launcher_starts_the_run_and_its_output_lands_in_the_log(tmp_path):
         subprocess.run([_tmux(), "kill-session", "-t", f"cosci-{name}"], capture_output=True)
         for p in (ROOT / "logs").glob(f"{name}.*"):
             p.unlink()
+
+
+def test_log_header_marks_code_that_differs_from_the_recorded_commit(tmp_path):
+    """The header records which code produced a result; uncommitted edits must show, or the hash is misleading."""
+    import shutil
+    import pytest
+    if not shutil.which("git"):
+        pytest.skip("needs git")
+    proj = tmp_path / "proj"
+    (proj / "bin").mkdir(parents=True)
+    shutil.copy(LAUNCHER, proj / "bin" / "cosci-bg")
+    (proj / ".gitignore").write_text("logs/\n")
+    fake = tmp_path / "cosci"
+    fake.write_text("#!/bin/sh\necho ran\n")
+    fake.chmod(0o755)
+    git = ["git", "-C", str(proj), "-c", "user.name=t", "-c", "user.email=t@example.com"]
+    subprocess.run(git + ["init", "-q"], check=True)
+    subprocess.run(git + ["add", "-A"], check=True)
+    subprocess.run(git + ["commit", "-q", "-m", "init"], check=True)
+    env = {**os.environ, "COSCI_BIN": str(fake), "COSCI_NO_NOTIFY": "1", "COSCI_FORCE": "1"}
+
+    def header(name):
+        subprocess.run(["bash", str(proj / "bin" / "cosci-bg"), name, "--goal", "g"], capture_output=True, text=True, env=env, check=True)
+        log = proj / "logs" / f"{name}.log"
+        deadline = time.time() + 10
+        while time.time() < deadline and not (log.exists() and "ran" in log.read_text()):
+            time.sleep(0.2)
+        return log.read_text().splitlines()[0]
+
+    try:
+        clean = header(f"clean-{os.getpid()}")
+        (proj / "bin" / "cosci-bg").write_text((proj / "bin" / "cosci-bg").read_text() + "\n# edited\n")
+        dirty = header(f"dirty-{os.getpid()}")
+    finally:
+        if _tmux():
+            for n in ("clean", "dirty"):
+                subprocess.run([_tmux(), "kill-session", "-t", f"cosci-{n}-{os.getpid()}"], capture_output=True)
+    assert "-dirty" not in clean
+    assert "-dirty" in dirty

@@ -226,6 +226,9 @@ class LLMBackend:
             return float(self.cfg.get("limit_poll", 300))   # reset time unknown: check again later
         return max(0.0, (e.reset_at - self._now()).total_seconds()) + 60   # a minute of margin past the reset
 
+    def close(self) -> None:
+        """Called once when a run ends (also after an interrupt). Backends release what they hold here."""
+
     def ping(self) -> str:
         obj = self.complete_json("Reply with ok=true.", "You are a test endpoint.",
                                  {"type": "object", "properties": {"ok": {"type": "boolean"}}, "required": ["ok"]},

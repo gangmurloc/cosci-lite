@@ -4,6 +4,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from ..config import OPTIONAL_ROLES
 from .base import BudgetExceeded, CallBudget, CallLogger, LLMBackend, LLMError
 from .claude_code import ClaudeCodeBackend
 from .mock import MockBackend
@@ -36,7 +37,8 @@ class Router:
         self._backends: dict[str, LLMBackend] = {}
 
     def backend_for(self, role: str) -> LLMBackend:
-        name = self.config["roles"][role]
+        roles = self.config["roles"]
+        name = roles.get(role) or roles[OPTIONAL_ROLES[role]]   # optional roles borrow another role's backend
         if name not in self._backends:
             self._backends[name] = make_backend(name, self.config["backends"][name], self.budget,
                                                 self.logger, self.workdir)
@@ -48,6 +50,10 @@ class Router:
             prompt += ("\n\n(Reminder: write ALL free-text JSON values in Korean, keeping technical terms, "
                        "model/dataset names and paper titles in English; search_queries and title_en stay in English.)")
         return self.backend_for(role).complete_json(prompt, system, schema, role=role, retries=retries)
+
+    def close(self) -> None:
+        for backend in self._backends.values():
+            backend.close()
 
     def max_workers(self, role: str) -> int:
         return max(1, self.backend_for(role).max_workers)

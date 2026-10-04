@@ -58,39 +58,42 @@ class Supervisor:
 
     # ------------------------------------------------------------------ run
     def run(self) -> RunState:
-        st = self.state
-        st.save()
-        stopped = None
-        for name, fn in self.plan_steps():
-            if st.is_done(name):
-                continue
-            try:
-                fn()
-            except BudgetExceeded as e:
-                stopped = str(e)
-                self.log(f"! 예산 소진으로 중단: {e}")
-                st.log_event("budget_stop", step=name, error=str(e))
-                break
-            except KeyboardInterrupt:
-                self.log("! 사용자 중단 — 상태를 저장합니다. `cosci resume <run_dir>`로 이어서 실행 가능")
+        try:
+            st = self.state
+            st.save()
+            stopped = None
+            for name, fn in self.plan_steps():
+                if st.is_done(name):
+                    continue
+                try:
+                    fn()
+                except BudgetExceeded as e:
+                    stopped = str(e)
+                    self.log(f"! 예산 소진으로 중단: {e}")
+                    st.log_event("budget_stop", step=name, error=str(e))
+                    break
+                except KeyboardInterrupt:
+                    self.log("! 사용자 중단 — 상태를 저장합니다. `cosci resume <run_dir>`로 이어서 실행 가능")
+                    self._sync()
+                    st.save()
+                    raise
+                st.mark_done(name)
                 self._sync()
                 st.save()
-                raise
-            st.mark_done(name)
+            if stopped and not st.overview:
+                # try to still write an overview with whatever budget remains on its backend
+                try:
+                    S.overview(self.ctx)
+                except BudgetExceeded:
+                    pass
             self._sync()
             st.save()
-        if stopped and not st.overview:
-            # try to still write an overview with whatever budget remains on its backend
-            try:
-                S.overview(self.ctx)
-            except BudgetExceeded:
-                pass
-        self._sync()
-        st.save()
-        report.write_report(st)
-        self._autosave()
-        st.save()
-        return st
+            report.write_report(st)
+            self._autosave()
+            st.save()
+            return st
+        finally:
+            self.router.close()   # e.g. take the local model off the GPU
 
     def _sync(self) -> None:
         self.state.calls = dict(self.router.budget.used)

@@ -261,3 +261,76 @@ def test_claude_backend_stops_waiting_after_limit_wait_max(tmp_path):
     with pytest.raises(LLMError):
         be.complete_json("What is 2+2?", "sys", SCHEMA, role="evolve", retries=0)
     assert 0 < sum(slept) <= 3600
+
+
+# --------------------------------------------------------------------------- unloading an Ollama model
+class _OllamaLikeHandler(BaseHTTPRequestHandler):
+    """/v1/chat/completions answers with required keys only; /api/ps and /api/generate behave like Ollama's."""
+    loaded: list = []
+    unloads: list = []
+    requests_seen: list = []
+
+    @classmethod
+    def reset(cls, loaded):
+        cls.loaded, cls.unloads, cls.requests_seen = list(loaded), [], []
+
+    def _json(self, obj):
+        data = json.dumps(obj).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_GET(self):
+        type(self).requests_seen.append(("GET", self.path))
+        self._json({"models": [{"name": m, "model": m} for m in type(self).loaded]})
+
+    def do_POST(self):
+        body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        type(self).requests_seen.append(("POST", self.path))
+        if self.path == "/api/generate":
+            type(self).unloads.append(body)
+            self._json({"done": True, "done_reason": "unload"})
+        else:
+            _reply(self, json.dumps(_required_only(body["response_format"]["json_schema"]["schema"])))
+
+    def log_message(self, *a):
+        pass
+
+
+def _close_with(loaded, **cfg):
+    _OllamaLikeHandler.reset(loaded)
+    srv = _serve(_OllamaLikeHandler)
+    try:
+        _local(srv, **cfg).close()
+    finally:
+        srv.shutdown()
+    return _OllamaLikeHandler
+
+
+def test_close_unloads_the_model_from_an_ollama_server_when_asked_to():
+    seen = _close_with(["m", "other"], unload_on_exit=True)
+    assert seen.unloads == [{"model": "m", "keep_alive": 0}]
+
+
+def test_close_does_not_touch_a_model_that_is_not_loaded():
+    # an unload request for a model that is not in memory must not be sent: it could load 18 GB just to drop it
+    seen = _close_with(["other"], unload_on_exit=True)
+    assert seen.unloads == []
+
+
+def test_close_leaves_the_server_alone_by_default():
+    seen = _close_with(["m"])
+    assert seen.requests_seen == []
+
+
+def test_duplicate_judge_uses_the_compare_backend_unless_a_dedupe_role_is_configured():
+    from cosci.config import load_config
+    from cosci.llm import Router
+
+    cfg = load_config(None, preset="mock", overrides={"backends": {"judge": {"type": "mock"}, "other": {"type": "mock"}},
+                                                      "roles": {"compare": "judge"}})
+    assert Router(cfg, None).backend_for("dedupe").name == "judge"
+    cfg["roles"]["dedupe"] = "other"
+    assert Router(cfg, None).backend_for("dedupe").name == "other"

@@ -121,6 +121,23 @@ def _clean_pid_refs(obj: Any, valid: set[str]) -> Any:
 def generate(ctx: Context, n: int, round_no: int) -> list[Hypothesis]:
     ctx.log(f"[3/6] 가설 생성 ({n}개)")
     st = ctx.state
+    already = [h for h in st.hypotheses.values() if h.origin == "generated" and h.round == round_no]
+    created = _generate_batches(ctx, max(0, n - len(already)), round_no, len(already))  # resume: only what is missing
+    dedupe(ctx, created)
+    llm_dedupe(ctx, created)
+    dropped = [h for h in created if h.status == "duplicate"]
+    if dropped and ctx.pcfg.get("replace_duplicates", True):
+        # one replacement pass, so duplicates do not shrink the pool the tournament starts from
+        more = _generate_batches(ctx, len(dropped), round_no, len(already) + len(created))
+        dedupe(ctx, more)
+        llm_dedupe(ctx, more)
+        created += more
+    ctx.log("      " + ", ".join(f"{h.hid}" + ("(중복)" if h.status == "duplicate" else "") for h in created))
+    return created
+
+
+def _generate_batches(ctx: Context, n: int, round_no: int, offset: int) -> list[Hypothesis]:
+    st = ctx.state
     strategies = list(P.GEN_STRATEGIES)
     rng = random.Random(int(ctx.pcfg.get("seed", 42)) + round_no)
     rng.shuffle(strategies)
@@ -128,9 +145,6 @@ def generate(ctx: Context, n: int, round_no: int) -> list[Hypothesis]:
     papers = select_papers(st, int(ctx.lcfg.get("digest_papers", 30)))
     feedback = _latest_guidance(st)
     created: list[Hypothesis] = []
-    already = [h for h in st.hypotheses.values() if h.origin == "generated" and h.round == round_no]
-    n = max(0, n - len(already))  # resume: only generate what is missing
-    offset = len(already)
     while len(created) < n:
         k = min(batch, n - len(created))
         strat = [strategies[(offset + i) % len(strategies)] for i in range(k)]
@@ -151,9 +165,38 @@ def generate(ctx: Context, n: int, round_no: int) -> list[Hypothesis]:
             st.add_hypothesis(h)
             created.append(h)
         st.save()
-    dedupe(ctx, created)
-    ctx.log("      " + ", ".join(f"{h.hid}" + ("(중복)" if h.status == "duplicate" else "") for h in created))
     return created
+
+
+def llm_dedupe(ctx: Context, new: list[Hypothesis]) -> None:
+    """Semantic duplicate check among generated hypotheses.
+
+    TF-IDF proximity cannot see paraphrases: two generated hypotheses stating the same claim scored 0.15,
+    inside the 0.12-0.28 range of unrelated pairs and far below the 0.85 threshold. One judge call groups hypotheses that make the same
+    claim; in each group the earliest stays active and later ones from `new` are marked duplicate (kept in
+    the report, left out of the tournament). Evolved hypotheses are refinements by design and are not checked.
+    """
+    if not ctx.pcfg.get("llm_dedupe", True):
+        return
+    st = ctx.state
+    pool = [h for h in st.hypotheses.values() if h.origin == "generated" and h.status == "active"]
+    fresh = {h.hid for h in new if h.origin == "generated" and h.status == "active"}
+    if len(pool) < 2 or not fresh:
+        return
+    try:
+        out = ctx.router.complete("dedupe", P.dedupe_prompt(pool), ctx.system, P.DEDUPE_SCHEMA)
+    except LLMError as e:
+        st.log_event("dedupe_failed", error=str(e)[:200])
+        return
+    order = {h.hid: i for i, h in enumerate(pool)}
+    for group in out.get("groups") or []:
+        ids = sorted({str(x).strip("[] ") for x in group.get("ids") or []} & set(order), key=lambda hid: order[hid])
+        for hid in ids[1:]:
+            h = st.hypotheses[hid]
+            if hid in fresh and h.status == "active":
+                h.status = "duplicate"
+                h.status_reason = f"{ids[0]}와 같은 주장 (LLM 판정): {str(group.get('shared_claim', ''))[:200]}"
+    st.save()
 
 
 def dedupe(ctx: Context, new: list[Hypothesis]) -> None:

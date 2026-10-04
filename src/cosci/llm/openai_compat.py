@@ -30,7 +30,7 @@ class OpenAICompatBackend(LLMBackend):
             "temperature": float(self.cfg.get("temperature", 0.7)),
             "max_tokens": int(self.cfg.get("max_tokens", 6000)),
         }
-        if role in ("compare", "debate", "review", "novelty"):
+        if role in ("compare", "debate", "review", "novelty", "dedupe"):
             payload["temperature"] = float(self.cfg.get("judge_temperature", 0.2))
         if schema is not None and self.json_mode == "schema":
             payload["response_format"] = {"type": "json_schema",
@@ -98,3 +98,21 @@ class OpenAICompatBackend(LLMBackend):
                 continue
             return strip_think(text), None, {"usage": d.get("usage", {})}
         raise LLMError(f"{self.base_url}: {last}")
+
+    def close(self) -> None:
+        """Ollama with `unload_on_exit: true`: take the model off the GPU now instead of after keep_alive.
+
+        Lets a run hold the GPU with a long keep_alive (no idle gaps in which another job grabs the card and
+        collides with the reload) and still free it the moment the run ends.
+        """
+        if not self.cfg.get("unload_on_exit"):
+            return
+        root = self.base_url[:-3] if self.base_url.endswith("/v1") else self.base_url
+        model = self.cfg.get("model")
+        try:
+            loaded = requests.get(f"{root}/api/ps", timeout=10).json().get("models") or []
+            # only if it is in memory: an unload request must never be what loads the model
+            if any(model in (m.get("name"), m.get("model")) for m in loaded):
+                requests.post(f"{root}/api/generate", json={"model": model, "keep_alive": 0}, timeout=30)
+        except (requests.RequestException, ValueError):
+            pass   # the server is gone or is not Ollama; keep_alive will expire on its own

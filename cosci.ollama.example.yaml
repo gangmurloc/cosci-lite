@@ -22,7 +22,8 @@ backends:
     connect_wait: 180   # keep retrying this long while the Ollama server restarts
     extra_body:
       reasoning_effort: none   # thinking off (Ollama ignores vLLM's chat_template_kwargs)
-      keep_alive: 30s          # the model leaves the GPU this long after the last call
+      keep_alive: 10m          # keep the model loaded through the Claude stages (no idle gaps on the GPU)
+    unload_on_exit: true       # and unload it the moment the run ends
 
 roles:
   parse: claude
@@ -35,6 +36,7 @@ roles:
   evolve: claude
   feedback: local
   overview: claude
+  dedupe: claude        # optional role: duplicate check, 1-2 calls per run (default: same backend as compare)
 
 literature:
   sources: [arxiv, openalex]   # add semantic_scholar once S2_API_KEY is set; without a key it returns HTTP 429

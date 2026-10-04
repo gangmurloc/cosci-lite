@@ -93,6 +93,7 @@ wrapper for machines where the only Claude Code install is the one bundled with 
 - `cosci-bg` prints the goal file it is about to use and refuses to start if template placeholders or empty items are still in it (an unsaved editor buffer is the usual cause). It also refuses to overwrite an existing log, warns when the Ollama server is down or not pinned to one GPU, and records the exact command in `logs/<name>.run.sh`.
 - **Subscription usage limit**: when `claude -p` reports "You've hit your session limit · resets 5:30am (...)", the run waits until that time and then continues, instead of failing the calls. The wait is capped by `backends.claude.limit_wait_max` (default 6 hours) and shows up in `cosci-status`.
 - **Server restarts**: if the local model server is down, calls keep retrying for `backends.local.connect_wait` seconds (default 180).
+- **Holding the GPU during a run (Ollama)**: with a short `keep_alive` the model leaves the GPU during the Claude stages, the card looks free for minutes, and another job that starts in that gap collides with the reload. Set a long `keep_alive` (for example `10m`) together with `unload_on_exit: true`: the model stays loaded for the whole run and is unloaded the moment the run ends, also after an interrupt.
 
 ## 6. Outputs
 
@@ -128,13 +129,14 @@ wrapper for machines where the only Claude Code install is the one bundled with 
 - Outputs: `examples/sample_report_claude_haiku_fixture.md` and `examples/sample_idea_file.md`
 - Measured on a shared GPU server (2026-10-04, live arXiv + OpenAlex search, `qwen3.5:27b` on one RTX A5000 through Ollama):
   - `local-only`, 3 hypotheses, 1 round: 57 local calls, 40 minutes.
+  - The same `local-only` setting after the fixes of 2026-10-05 (all hypothesis fields required, duplicate check, unload on exit): 56 local calls, 0 failures, 39 minutes; every hypothesis came back with all fields filled, and the model left the GPU within seconds of the run ending.
   - `hybrid` (Claude `sonnet`), 8 hypotheses, 2 rounds: 46 Claude calls and 124 local calls, 1 hour 51 minutes, $6.25 at list prices. This run hit the subscription session limit once; 15 Claude calls failed because the version at the time did not wait for the reset.
 - With the default settings (8 hypotheses, 2 rounds), the hybrid preset is expected to make roughly 40–70 Claude calls and 100–200 local calls *(an estimate; the measured run above made 46 and 124)*. Turning on live search adds time spent waiting on API rate limits.
 
 ## 9. Limitations (please read)
 
 - **Elo is a relative rating from an LLM judge, not ground truth.** The paper itself makes the same point. With 3–4 games per hypothesis the top ranks are usually within one game of each other; the report now says which top ranks are indistinguishable and groups hypotheses by the original idea they descend from.
-- **Duplicate detection is weak.** Proximity uses TF-IDF similarity with a 0.85 threshold. In the measured hybrid run, three generated hypotheses that made the same claim scored 0.12–0.28 against each other, the same range as unrelated pairs, so paraphrased duplicates are not caught. Read the ranking by family, not by row.
+- **Duplicate detection** has two layers. Proximity (TF-IDF similarity, threshold 0.85) only catches near-copies: in the measured hybrid run two generated hypotheses stating the same claim scored 0.15, inside the 0.12–0.28 range of unrelated pairs. So after generation one judge call (`pipeline.llm_dedupe`) groups hypotheses that make the same claim; the later ones are marked duplicate and replaced. Checked with Claude `sonnet` on that run's 8 initial hypotheses (it grouped the one true pair and left a competing prediction alone) and on 3 unrelated ones (no groups). With the local judge (`qwen3.5:27b`) only the no-duplicate case has been observed so far. Evolved hypotheses are refinements by design and are not checked, so read the ranking by family, not by row.
 - Novelty judgments only cover the papers that were retrieved. Even an N3 or higher should be checked by searching again yourself.
 - Free-tier rate limits on the search APIs can slow runs down. arXiv calls are spaced 3 seconds apart.
 - Not yet implemented: the asynchronous Supervisor and worker queue, observation and simulation reviews, and true multi-turn debates (approximated with a single-prompt debate).

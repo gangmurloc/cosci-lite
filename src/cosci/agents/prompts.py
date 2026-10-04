@@ -158,6 +158,11 @@ COMPARE_SCHEMA = _obj({
     "confidence": {"type": "number", "minimum": 0, "maximum": 1},
 }, ["deciding_factor", "winner"])
 
+DEDUPE_SCHEMA = _obj({
+    "groups": _arr(_obj({"ids": _arr(desc="ids of two or more hypotheses that make the same core claim"),
+                         "shared_claim": _s("the claim they share, in one sentence")}, ["ids", "shared_claim"])),
+}, ["groups"])
+
 DEBATE_SCHEMA = _obj({
     "debate": _arr(_obj({"speaker": _s("advocate_A | advocate_B | skeptic"), "point": _s()}, ["speaker", "point"])),
     "key_assumption": _s("the assumption that decides the comparison"),
@@ -378,6 +383,22 @@ experimental clarity. Do not prefer a hypothesis because it sounds more sophisti
 
 # HYPOTHESIS B
 {fmt_hyp(b, 'core')}
+"""
+
+
+def dedupe_prompt(hyps: list[Hypothesis]) -> str:
+    items = "\n".join(json.dumps({"id": h.hid, "title": h.fields.get("title"), "one_liner": h.fields.get("one_liner"),
+                                  "statement": truncate(h.fields.get("statement"), 700)}, ensure_ascii=False)
+                      for h in hyps)
+    return f"""# TASK: Duplicate check (Proximity)
+Find hypotheses in the list that make the same core claim: the same manipulated factor, the same outcome and the
+same predicted direction, so that one experiment would confirm or refute all of them. Different wording, framing,
+strategy label, extra controls or a narrower range of the same factor do not make two hypotheses different.
+Hypotheses that only share a topic, dataset, benchmark or method but test different claims are NOT duplicates.
+When in doubt, do not group. Return an empty `groups` list if nothing is duplicated.
+
+# HYPOTHESES
+{items}
 """
 
 

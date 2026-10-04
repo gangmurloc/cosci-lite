@@ -21,6 +21,11 @@ ROLES = [
     "overview",  # final research overview
 ]
 
+# Roles that need no entry in `roles`: without one they use the backend of the role named here.
+OPTIONAL_ROLES = {
+    "dedupe": "compare",   # semantic duplicate check among generated hypotheses
+}
+
 DEFAULTS: dict[str, Any] = {
     "language": "ko",
     "backends": {
@@ -87,6 +92,8 @@ DEFAULTS: dict[str, Any] = {
         "swap_check_debate": False,  # debates are already order-robust and costlier
         "elo_k": 32,
         "dedupe_threshold": 0.85,
+        "llm_dedupe": True,          # ask a judge which generated hypotheses make the same claim (TF-IDF misses paraphrases)
+        "replace_duplicates": True,  # generate replacements for hypotheses marked duplicate
         "meta_feedback": True,
         "seed": 42,
     },
