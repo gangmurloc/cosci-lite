@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+build/
+dist/
+
+# Local configuration and run outputs (research goals, generated ideas, logs)
+cosci.yaml
+goal.md
+runs/
+Research-Ideas/
+logs/
+
+# Original hand-off archive
+cosci-lite.zip

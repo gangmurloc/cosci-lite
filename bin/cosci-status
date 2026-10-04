@@ -1,0 +1,206 @@
+#!/usr/bin/env python3
+"""cosci-lite 실행 진행 상황 보기.
+
+사용법:
+  cosci-status              가장 최근 실행을 한 번 출력
+  cosci-status -w           10초마다 새로 고침 (Ctrl+C로 종료)
+  cosci-status -w 5         5초마다 새로 고침
+  cosci-status runs/<폴더>   특정 실행 지정
+"""
+import datetime as dt
+import json
+import os
+import subprocess
+import sys
+import time
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+STEP_NAMES = {"parse": "연구 목표 파싱", "literature": "문헌 탐색", "generate": "가설 생성", "review": "리뷰",
+              "tournament": "토너먼트", "feedback": "메타 피드백", "evolve": "진화", "overview": "최종 개요"}
+
+
+def latest_run():
+    base = os.path.join(ROOT, "runs")
+    if not os.path.isdir(base):
+        return None
+    runs = sorted(d for d in os.listdir(base) if os.path.isfile(os.path.join(base, d, "state.json")))
+    return os.path.join(base, runs[-1]) if runs else None
+
+
+def planned_steps(cfg):
+    p = cfg.get("pipeline", {})
+    rounds, meta = int(p.get("rounds", 2)), p.get("meta_feedback", True)
+    seq = ["parse", "literature", "generate:0", "review:0", "tournament:0"]
+    if meta:
+        seq.append("feedback:0")
+    for r in range(1, rounds + 1):
+        seq += ["evolve:%d" % r, "review:%d" % r, "tournament:%d" % r]
+        if meta and r < rounds:
+            seq.append("feedback:%d" % r)
+    return seq + ["overview"]
+
+
+def label(step):
+    name, _, rnd = step.partition(":")
+    return STEP_NAMES.get(name, name) + (" (라운드 %s)" % rnd if rnd else "")
+
+
+def sh(cmd):
+    try:
+        return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                              universal_newlines=True, timeout=10).stdout.strip()
+    except Exception:
+        return ""
+
+
+def running(run_dir):
+    out = sh(["pgrep", "-u", str(os.getuid()), "-af", "cosci (run|resume|continue)"])
+    return any("bin/cosci" in line or "-m cosci" in line for line in out.splitlines())
+
+
+def parse_time(s):
+    try:
+        return dt.datetime.fromisoformat(s).replace(tzinfo=None)
+    except Exception:
+        return None
+
+
+def fmt_dur(sec):
+    sec = int(max(0, sec))
+    return "%d분 %02d초" % (sec // 60, sec % 60) if sec < 3600 else "%d시간 %02d분" % (sec // 3600, sec % 3600 // 60)
+
+
+def failure_cause(error):
+    e = (error or "").lower()
+    if "limit" in e:
+        return "사용량 한도"
+    if "connection error" in e:
+        return "서버 연결 실패"
+    if "timed out" in e or "timeout" in e:
+        return "시간 초과"
+    if "json" in e or "missing required" in e or "empty answer" in e:
+        return "응답 형식 오류"
+    return "기타"
+
+
+def show(run_dir):
+    try:
+        with open(os.path.join(run_dir, "state.json"), encoding="utf-8") as f:
+            st = json.load(f)
+    except Exception as e:   # 저장 도중에 읽으면 잠깐 실패할 수 있음
+        print("state.json을 읽지 못했습니다 (%s). 잠시 후 다시 시도하세요." % e)
+        return
+    calls, waits = [], []   # waits: 사용량 한도가 풀리기를 기다린 기록 (호출이 아님)
+    cpath = os.path.join(run_dir, "calls.jsonl")
+    if os.path.exists(cpath):
+        with open(cpath, encoding="utf-8") as f:
+            for line in f:
+                try:
+                    rec = json.loads(line)
+                except Exception:
+                    continue
+                (waits if "wait" in rec else calls).append(rec)
+
+    now = dt.datetime.now()
+    alive = running(run_dir)
+    done = st.get("steps_done", [])
+    steps = planned_steps(st.get("config", {}))
+    finished = "overview" in done and os.path.exists(os.path.join(run_dir, "report.md"))
+    started = parse_time(st.get("created", ""))
+    last_call = parse_time(calls[-1]["t"]) if calls else None
+
+    status = "완료" if finished else ("실행 중" if alive else "멈춤 (프로세스 없음)")
+    print("실행 폴더 : %s" % os.path.relpath(run_dir, ROOT))
+    line = "상태      : %s" % status
+    if started:
+        end = now if alive or not last_call else last_call
+        line += "   |   시작 %s, 경과 %s" % (started.strftime("%H:%M:%S"), fmt_dur((end - started).total_seconds()))
+    print(line)
+    print("현재 시각 : %s" % now.strftime("%H:%M:%S"))
+
+    print("\n[단계] %d/%d 완료" % (len([s for s in steps if s in done]), len(steps)))
+    current_marked = False
+    for s in steps:
+        if s in done:
+            mark = "✔"
+        elif not current_marked and not finished:
+            mark, current_marked = ("▶" if alive else "✖"), True
+        else:
+            mark = "·"
+        print("  %s %s" % (mark, label(s)))
+
+    hyps = list(st.get("hypotheses", {}).values())
+    print("\n[가설] %d개 (논문 %d편 수집, 대결 %d회)" % (len(hyps), len(st.get("papers", {})), len(st.get("matches", []))))
+    if hyps:
+        print("  ID       Elo   승-패-무  Novelty  상태       제목")
+        for h in sorted(hyps, key=lambda h: (h.get("status") != "active", -h.get("elo", 0))):
+            nov = (h.get("novelty_review") or {}).get("novelty", "?")
+            wld = "%d-%d-%d" % (h.get("wins", 0), h.get("losses", 0), h.get("draws", 0))
+            title = str((h.get("fields") or {}).get("title", ""))[:50]
+            print("  %-7s %5.0f  %-8s  %-7s  %-9s  %s" % (h.get("hid", ""), h.get("elo", 0), wld, nov, h.get("status", ""), title))
+
+    fails = [c for c in calls if not c.get("ok")]
+    total_sec = sum(c.get("latency", 0) for c in calls)
+    print("\n[LLM 호출] %d건 (실패 %d건), 누적 %s" % (len(calls), len(fails), fmt_dur(total_sec)))
+    if fails:
+        causes = {}
+        for c in fails:
+            k = failure_cause(c.get("error"))
+            causes[k] = causes.get(k, 0) + 1
+        print("  실패 원인: " + ", ".join("%s %d건" % kv for kv in sorted(causes.items(), key=lambda kv: -kv[1])))
+    for c in calls[-5:]:
+        print("  %s  %-9s %-6s %s %6.1f초  %s" % (c.get("t", "")[11:19], c.get("role", ""), c.get("backend", ""),
+              "성공" if c.get("ok") else "실패", c.get("latency", 0), (c.get("error") or "")[:70]))
+    if waits:
+        w = waits[-1]
+        until = parse_time(w.get("until", ""))
+        state = " ← 지금 대기 중" if (alive and until and now < until) else ""
+        print("  사용량 한도 대기 %d회. 마지막: %s에 %s 한도 도달, %s까지 대기 (%s)%s" % (
+            len(waits), w.get("t", "")[11:19], w.get("backend", ""), w.get("until", "")[11:16],
+            fmt_dur(w.get("wait", 0)), state))
+    if alive and last_call:
+        print("  마지막 호출이 끝난 지 %s (긴 호출은 1~3분 걸립니다)" % fmt_dur((now - last_call).total_seconds()))
+
+    gpu = sh(["nvidia-smi", "--query-gpu=index,memory.used,memory.total,utilization.gpu", "--format=csv,noheader,nounits"])
+    if gpu:
+        print("\n[GPU]")
+        for g in gpu.splitlines():
+            i, used, total, util = [x.strip() for x in g.split(",")]
+            print("  GPU %s: %5.1f / %.1f GB, 사용률 %s%%" % (i, int(used) / 1024, int(total) / 1024, util))
+    if finished:
+        print("\n리포트: %s" % os.path.join(run_dir, "report.md"))
+
+
+def main():
+    args = sys.argv[1:]
+    if "-h" in args or "--help" in args:
+        print(__doc__)
+        return 0
+    watch = None
+    if "-w" in args:
+        i = args.index("-w")
+        args.pop(i)
+        watch = 10.0
+        if i < len(args) and args[i].replace(".", "", 1).isdigit():
+            watch = float(args.pop(i))
+    run_dir = os.path.abspath(args[0]) if args else latest_run()
+    if not run_dir or not os.path.isfile(os.path.join(run_dir, "state.json")):
+        print("실행 기록을 찾지 못했습니다: %s" % (run_dir or os.path.join(ROOT, "runs")))
+        return 1
+    if watch is None:
+        show(run_dir)
+        return 0
+    try:
+        while True:
+            sys.stdout.write("\033[2J\033[H")   # 화면 지우기
+            show(run_dir)
+            print("\n(%g초마다 새로 고침, Ctrl+C로 종료)" % watch)
+            sys.stdout.flush()
+            time.sleep(watch)
+    except KeyboardInterrupt:
+        print()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

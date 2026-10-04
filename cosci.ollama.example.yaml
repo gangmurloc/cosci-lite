@@ -1,0 +1,61 @@
+# cosci-lite config for a local Ollama server plus Claude Code (hybrid preset).
+# Copy to cosci.yaml and adjust. Values not listed here use the defaults in src/cosci/config.py.
+# Checked with Ollama 0.35.1 and qwen3.5:27b on one 24 GB GPU.
+language: ko            # ko: free text in Korean (technical terms in English), en: English
+
+backends:
+  claude:               # Claude Code CLI (claude -p). Runs on your logged-in Claude subscription.
+    type: claude_code
+    executable: claude  # or the path to bin/claude if only the VS Code extension's binary is installed
+    model: sonnet
+    allow_web: false
+    timeout: 900
+    limit_wait_max: 21600   # on a subscription usage limit, wait up to this many seconds for the reset (0 = fail)
+  local:
+    type: openai_compatible
+    base_url: http://127.0.0.1:11434/v1
+    model: qwen3.5:27b
+    json_mode: schema
+    max_workers: 1      # Ollama answers one request at a time; parallel requests only queue and time out
+    timeout: 900
+    max_tokens: 12000   # three fully filled-in hypotheses in one call take 5-6k tokens
+    connect_wait: 180   # keep retrying this long while the Ollama server restarts
+    extra_body:
+      reasoning_effort: none   # thinking off (Ollama ignores vLLM's chat_template_kwargs)
+      keep_alive: 30s          # the model leaves the GPU this long after the last call
+
+roles:
+  parse: claude
+  digest: claude
+  generate: local
+  review: local
+  novelty: claude
+  compare: local
+  debate: claude
+  evolve: claude
+  feedback: local
+  overview: claude
+
+literature:
+  sources: [arxiv, openalex]   # add semantic_scholar once S2_API_KEY is set; without a key it returns HTTP 429
+  per_query: 8
+  max_papers: 60
+  mailto: ""
+  min_year: 2023
+
+pipeline:
+  n_initial: 8
+  rounds: 2
+  evolve_top_k: 3
+  matches_per_hyp: 3
+  debate_top_k: 4
+  swap_check: true
+
+budget:
+  max_calls: {claude: 80, local: 600}
+
+output:
+  runs_dir: runs
+  ideas_dir: ~/Research-Ideas
+  auto_save_top_k: 2
+  auto_save_min_novelty: N2

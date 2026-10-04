@@ -1,0 +1,6 @@
+#!/bin/sh
+# 이 서버에는 claude CLI가 따로 설치돼 있지 않아서, VS Code 확장에 들어 있는 실행 파일 중
+# 가장 최신 버전을 찾아 실행한다. (확장이 업데이트되면 폴더 이름이 바뀌므로 매번 찾는다)
+bin=$(ls -d "$HOME"/.vscode-server/extensions/anthropic.claude-code-*/resources/native-binary/claude 2>/dev/null | sort -V | tail -1)
+[ -x "$bin" ] || { echo "claude 실행 파일을 ~/.vscode-server/extensions 에서 찾지 못했습니다" >&2; exit 127; }
+exec "$bin" "$@"

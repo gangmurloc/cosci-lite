@@ -1,0 +1,121 @@
+#!/usr/bin/env bash
+# cosci-lite 실행을 백그라운드(tmux)로 시작한다. 로그는 logs/<실험명>.log에 남고, 끝나면 ntfy 알림이 간다.
+#
+# 사용법: cosci-bg [--dry-run] <실험명> [cosci run 옵션...]
+#   예:   cosci-bg run3 --goal-file goal.md
+#         cosci-bg run3 --goal-file goal.md --preset local-only
+#   --dry-run          아무것도 시작하지 않고, 사용할 목표와 실행할 명령만 보여 준다
+#   COSCI_FORCE=1      goal 파일 점검과 중복 실행 점검을 건너뛴다
+#   COSCI_NO_NOTIFY=1  종료 알림을 보내지 않는다
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+COSCI="${COSCI_BIN:-$HOME/miniconda3/envs/cosci/bin/cosci}"
+NTFY="$HOME/.claude/hooks/ntfy_notify.py"
+TMUX_BIN="$(command -v tmux || true)"
+[ -n "$TMUX_BIN" ] || TMUX_BIN="$HOME/.local/bin/tmux"
+
+die() { echo "오류: $*" >&2; exit 1; }
+warn() { echo "주의: $*" >&2; }
+
+dry=0
+if [ "${1:-}" = "--dry-run" ]; then dry=1; shift; fi
+if [ $# -lt 1 ] || [[ "$1" == -* ]]; then
+  sed -n '2,10p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  exit 2
+fi
+name="$1"; shift
+[[ "$name" =~ ^[A-Za-z0-9._-]+$ ]] || die "실험명에는 영문, 숫자, . _ - 만 쓸 수 있습니다: $name"
+args=("$@")
+log="logs/$name.log"
+session="cosci-$name"
+force="${COSCI_FORCE:-0}"
+
+# goal 파일 경로는 호출한 위치 기준으로 해석한다 (아래에서 프로젝트 폴더로 이동하기 전에)
+goal=""
+for ((i = 0; i < ${#args[@]}; i++)); do
+  if [ "${args[i]}" = "--goal-file" ] && [ $((i + 1)) -lt ${#args[@]} ]; then
+    goal="$(realpath -m "${args[i + 1]}")"
+    args[i + 1]="$goal"
+  fi
+done
+
+cd "$ROOT"
+[ -x "$COSCI" ] || die "cosci 실행 파일이 없습니다: $COSCI"
+[ ! -e "$log" ] || die "이미 있는 로그입니다: $log (다른 실험명을 쓰세요)"
+
+if [ -n "$goal" ]; then
+  [ -f "$goal" ] || die "goal 파일이 없습니다: $goal"
+  echo "== 사용할 연구 목표: $goal (마지막 저장 $(date -r "$goal" '+%m-%d %H:%M:%S'))"
+  sed 's/^/   | /' "$goal"
+  echo
+  # 템플릿 문구나 값이 빈 항목이 남아 있으면, 저장하지 않았거나 덜 채운 상태로 시작하려는 것이다
+  if left="$(grep -nE '\(예:|\(무엇을 알고 싶은지|\(empirical finding /|^-[[:space:]]*$|^-[[:space:]][^:]+:[[:space:]]*$' "$goal")"; then
+    echo "goal 파일에 템플릿 문구나 빈 항목이 남아 있습니다:" >&2
+    echo "$left" | sed 's/^/   /' >&2
+    [ "$force" = 1 ] || die "편집기에서 저장했는지 확인하고, 빈 항목은 채우거나 지우세요. (그대로 쓰려면 COSCI_FORCE=1)"
+  fi
+fi
+
+# 점검: 다른 실행, Ollama 서버, GPU
+if pgrep -u "$(id -u)" -f 'bin/cosci (run|resume|continue)' > /dev/null; then
+  warn "이미 돌고 있는 cosci 실행이 있습니다. 로컬 모델은 요청을 하나씩 처리하므로 둘 다 느려지고 시간 초과가 날 수 있습니다."
+  [ "$dry" = 1 ] || [ "$force" = 1 ] || die "먼저 끝나기를 기다리세요. (그래도 시작하려면 COSCI_FORCE=1)"
+fi
+case " ${args[*]} " in
+  *" --preset claude-only "* | *" --preset mock "*) ;;
+  *)
+    opid="$(pgrep -u "$(id -u)" -x ollama | head -1 || true)"
+    if [ -z "$opid" ]; then
+      warn "Ollama 서버가 떠 있지 않습니다. 서버 탭에서 먼저 실행하세요:"
+      warn "  GGML_VK_VISIBLE_DEVICES=0 OLLAMA_HOST=127.0.0.1:11434 ~/.local/ollama/bin/ollama serve"
+    elif ! tr '\0' '\n' < "/proc/$opid/environ" 2> /dev/null | grep -q '^GGML_VK_VISIBLE_DEVICES='; then
+      warn "Ollama 서버가 GGML_VK_VISIBLE_DEVICES 없이 떠 있어 GPU 두 장을 모두 잡을 수 있습니다."
+    fi
+    ;;
+esac
+if command -v nvidia-smi > /dev/null; then
+  echo "== GPU 상태"
+  nvidia-smi --query-gpu=index,memory.used,memory.total,utilization.gpu --format=csv,noheader | sed 's/^/   GPU /'
+  echo
+fi
+
+quoted=""
+for a in "${args[@]}"; do quoted+=" $(printf '%q' "$a")"; done
+echo "== 실행할 명령: cosci run ${args[*]}"
+echo "== 로그: $log"
+if [ "$dry" = 1 ]; then
+  echo "(--dry-run: 아무것도 시작하지 않았습니다)"
+  exit 0
+fi
+
+mkdir -p logs
+commit="$(git -C "$ROOT" rev-parse --short HEAD 2> /dev/null || echo 'git 저장소 아님')"
+notify=":"
+if [ "${COSCI_NO_NOTIFY:-0}" != 1 ] && [ -f "$NTFY" ]; then
+  notify="python3 $(printf '%q' "$NTFY") \"$name 종료 (exit \$rc)\" --priority 4"
+fi
+# Claude Code 세션 안에서 시작해도 claude -p가 일반 터미널에서처럼 돌도록 세션 표시 변수를 지운다 (인증 변수는 남김)
+run_cmd="cd $(printf '%q' "$ROOT")
+for v in \$(env | grep -E '^CLAUDE' | cut -d= -f1 | grep -vE '^(CLAUDE_CODE_OAUTH_TOKEN|CLAUDE_CONFIG_DIR)\$'); do unset \"\$v\"; done
+{ echo \"# $name | 시작 \$(date '+%F %T') | commit: $commit | cosci run ${args[*]}\"
+  PYTHONUNBUFFERED=1 $(printf '%q' "$COSCI") run$quoted; } 2>&1 | tee $(printf '%q' "$log")
+rc=\${PIPESTATUS[0]}
+$notify"
+
+# 실행할 내용을 파일로 남기고 그 파일을 실행한다. (tmux는 명령을 sh로 넘기므로 여러 줄 bash 명령을 인자로 주면 깨진다.
+# 무엇을 어떻게 돌렸는지 기록으로도 남는다.)
+script="logs/$name.run.sh"
+printf '%s\n' "$run_cmd" > "$script"
+
+if [ -x "$TMUX_BIN" ]; then
+  "$TMUX_BIN" has-session -t "$session" 2> /dev/null && die "tmux 세션이 이미 있습니다: $session"
+  "$TMUX_BIN" new-session -d -s "$session" "bash $(printf '%q' "$ROOT/$script")"
+  echo "시작했습니다 (tmux 세션: $session)"
+  echo "   화면 보기: $TMUX_BIN attach -t $session   (빠져나오기: Ctrl+b 누른 뒤 d)"
+else
+  nohup setsid bash "$ROOT/$script" > /dev/null 2>&1 < /dev/null &
+  echo "시작했습니다 (tmux가 없어 nohup으로 실행)"
+fi
+echo "   진행 상황: $ROOT/bin/cosci-status -w"
+echo "   로그:      tail -f $ROOT/$log"
